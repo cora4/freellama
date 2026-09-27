@@ -441,7 +441,7 @@ extern "C" {
         GGML_TYPE_IQ5_K   = 140,
         GGML_TYPE_IQ6_K   = 141,
         // Prism ternary (ids match PrismML-Eng/llama.cpp)
-        GGML_TYPE_PQ2_0   = 142,
+        GGML_TYPE_PQ2_0   = 42,
         GGML_TYPE_PTQ1_0  = 143,
         GGML_TYPE_IQ4_KS  = 144,
         GGML_TYPE_IQ2_KS  = 145,

@@ -152,9 +152,12 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_fused_delta_net(ggml_co
 
 std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_qkvz(llama_context & lctx, ggml_context * ctx0,
         ggml_tensor * wqkv, ggml_tensor * wqkv_gate,
-        ggml_tensor * input, int il, const llm_build_cb & cb, ggml_cgraph * gf) {
+        ggml_tensor * input, int il, const llm_build_cb & cb, ggml_cgraph * gf, const llama_hadamard_transform * rot) {
 
     const int64_t n_tok = input->ne[1];
+    if (rot) {
+        input = llm_build_hadamard_rotate(ctx0, input, *rot);
+    }
     auto qkv_mixed = llm_build_context::llm_build_lora_mm(lctx, ctx0, wqkv, input);
     cb(qkv_mixed, "qkv_mixed", il);
     ggml_tensor * z = llm_build_context::llm_build_lora_mm(lctx, ctx0, wqkv_gate, input);
@@ -222,9 +225,9 @@ std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_qkvz(llama_context & lc
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> delta_net::build_qkvz(llama_context & lctx, ggml_context * ctx0, ggml_tensor * wqkv, ggml_tensor * wqkv_gate, ggml_tensor * ssm_in,
-            int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, ggml_tensor * input, int il, const llm_build_cb & cb, ggml_cgraph * gf) {
+            int64_t head_k_dim, int64_t num_k_heads, int64_t head_v_dim, int64_t num_v_heads, ggml_tensor * input, int il, const llm_build_cb & cb, ggml_cgraph * gf, const llama_hadamard_transform * rot) {
     GGML_ASSERT((wqkv && wqkv_gate) || ssm_in);
-    return wqkv && wqkv_gate ? build_qkvz(lctx, ctx0, wqkv, wqkv_gate, input, il, cb, gf)
+    return wqkv && wqkv_gate ? build_qkvz(lctx, ctx0, wqkv, wqkv_gate, input, il, cb, gf, rot)
                              : build_qkvz(lctx, ctx0, ssm_in, head_k_dim, num_k_heads, head_v_dim, num_v_heads, input, il, cb);
 }
 
@@ -406,7 +409,7 @@ ggml_tensor * delta_net::build_qkv(ggml_context * ctx0, ggml_tensor * state_stor
 }
 
 ggml_tensor * delta_net::build_gated_output(llama_context & lctx, ggml_context * ctx0, ggml_tensor * ssm_norm, ggml_tensor * ssm_out, ggml_tensor * output, ggml_tensor * z,
-        int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb, ggml_unary_op gate_op) {
+        int64_t head_v_dim, int64_t num_v_heads, int64_t n_tok, int il, const llm_build_cb & cb, ggml_unary_op gate_op, const llama_hadamard_transform * rot) {
 
     ggml_tensor * attn_out_2d = ggml_reshape_2d(ctx0, output, head_v_dim, num_v_heads * n_tok);
     ggml_tensor * z_2d        = ggml_reshape_2d(ctx0, z,      head_v_dim, num_v_heads * n_tok);
@@ -422,6 +425,9 @@ ggml_tensor * delta_net::build_gated_output(llama_context & lctx, ggml_context *
 
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim*num_v_heads, n_tok);
     cb(final_output, "final_output", il);
+    if (rot) {
+        final_output = llm_build_hadamard_rotate(ctx0, final_output, *rot);
+    }
 
     ggml_tensor * out = llm_build_context::llm_build_lora_mm(lctx, ctx0, ssm_out, final_output);
     cb(out, "linear_attn_out", il);
@@ -451,7 +457,8 @@ static ggml_tensor * get_input_tensor_sm_graph(ggml_context * ctx, ggml_tensor *
 ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * delta_input, ggml_tensor * inp_s_seq_qnext, ggml_tensor * inp_out_ids,
             uint32_t state_seq_id_local, bool reset_state_local, int il, const llm_build_cb & cb,
-            bool external_residual, ggml_unary_op gate_op) const {
+            bool external_residual, ggml_unary_op gate_op,
+            const llama_hadamard_transform * rot_attn, const llama_hadamard_transform * rot_ssm) const {
 
     const int64_t n_tok = delta_input->ne[1];
     const int64_t n_seqs = 1;
@@ -594,7 +601,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     }
 
     auto [qkv_mixed, z] = build_qkvz(lctx, ctx0, model.layers[il].wqkv, model.layers[il].wqkv_gate, model.layers[il].ssm_in,
-            head_k_dim, num_k_heads, head_v_dim, num_v_heads, cur, il, cb, gf);
+            head_k_dim, num_k_heads, head_v_dim, num_v_heads, cur, il, cb, gf, rot_attn);
 
     auto [beta, gate] = build_beta_gate(lctx, ctx0, model.layers[il].ssm_beta_alpha, model.layers[il].ssm_beta, model.layers[il].ssm_alpha,
             model.layers[il].ssm_dt, model.layers[il].ssm_a, num_k_heads, num_v_heads, n_seqs, cur, il, cb, gf);
@@ -614,7 +621,7 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
         state_seq_id_local, qnext_state_slots, reset_state_local, hparams.f_norm_rms_eps,
         model.layers[il].ssm_beta_alpha ? 0 : 1, il, cb, gf, per_step_ckpt, per_step_conv);
 
-    auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb, gate_op);
+    auto gated_output = build_gated_output(lctx, ctx0, model.layers[il].ssm_norm, model.layers[il].ssm_out, output, z, head_v_dim, num_v_heads, n_tok, il, cb, gate_op, rot_ssm);
     if (inp_out_ids) {
         gated_output = ggml_get_rows(ctx0, gated_output, inp_out_ids);
         input        = ggml_get_rows(ctx0, input, inp_out_ids);
@@ -627,7 +634,8 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
 
 ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
         ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
-        bool external_residual, ggml_unary_op gate_op) const {
+        bool external_residual, ggml_unary_op gate_op,
+        const llama_hadamard_transform * rot_attn, const llama_hadamard_transform * rot_ssm) const {
     GGML_ASSERT(lctx.inp_s_seq_qnext != nullptr);
 
     auto & model = lctx.model;
@@ -645,7 +653,7 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
     if (all_same_seq) {
         bool reset_state = batch.pos != nullptr && batch.pos[0] == 0;
-        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, external_residual, gate_op);
+        return build_layer_attn_linear_core(ctx0, gf, cur, lctx.inp_s_seq_qnext, inp_out_ids, token_seq_ids.front(), reset_state, il, cb, external_residual, gate_op, rot_attn, rot_ssm);
     }
 
     GGML_ASSERT(has_unique_seq_ids && "qwen3next mixed-sequence batches require unique sequence IDs per token");
@@ -657,7 +665,7 @@ ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgrap
 
         const bool reset_state_i = batch.pos != nullptr && batch.pos[i] == 0;
         const uint32_t state_seq_id_i = (uint32_t) token_seq_ids[i];
-        ggml_tensor * out_i = build_layer_attn_linear_core(ctx0, gf, cur_i, inp_s_seq_qnext_i, inp_out_ids, state_seq_id_i, reset_state_i, il, cb, external_residual, gate_op);
+        ggml_tensor * out_i = build_layer_attn_linear_core(ctx0, gf, cur_i, inp_s_seq_qnext_i, inp_out_ids, state_seq_id_i, reset_state_i, il, cb, external_residual, gate_op, rot_attn, rot_ssm);
 
         out = out == nullptr ? out_i : ggml_concat(ctx0, out, out_i, 1);
     }

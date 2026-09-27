@@ -2104,7 +2104,7 @@ class GGMLQuantizationType(IntEnum):
     IQ4_K     = 139
     IQ5_K     = 140
     IQ6_K     = 141
-    PQ2_0     = 142
+    PQ2_0     = 42
     PTQ1_0    = 143
     IQ4_KS    = 144
     IQ2_KS    = 145

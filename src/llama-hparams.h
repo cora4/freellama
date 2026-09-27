@@ -186,6 +186,10 @@ struct llama_hparams {
     std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_source        = {};
     std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_key_source = {};
     std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_source      = {};
+
+    int32_t  dsv4_candidate_source_layer = -1;
+    uint32_t dsv4_candidate_block_size   = 0;
+    uint32_t dsv4_candidate_topk_blocks  = 0;
     bool dsv41_is_kv_source   (uint32_t il) const { return dsv4_shared_streams && dsv41_kv_source[il]        == (int32_t) il; }
     bool dsv41_owns_index_k   (uint32_t il) const { return dsv4_shared_streams && dsv41_index_key_source[il] == (int32_t) il; }
     bool dsv41_is_index_source(uint32_t il) const { return dsv4_shared_streams && dsv41_topk_source[il]      == (int32_t) il; }
@@ -245,6 +249,11 @@ struct llama_hparams {
     float    dflash_backbone_rotary_base = 0.0f;
     bool     dflash_laguna = false;
     bool     dflash_dsv4 = false;
+    bool     dflash_dsv41 = false;  // DSV4 draft with V4.1 rules: lagged hyper-connections, no output head
+    // DSpark proposal blocks attend bidirectionally within the block and to one fixed window
+    // of the last n_swa committed positions (reference get_dspark_topk_idxs); other drafts
+    // keep the causal, per-row sliding mask
+    bool     dflash_block_bidir = false;
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggerganov/llama.cpp/pull/8141
@@ -275,6 +284,8 @@ struct llama_hparams {
         if (this->dflash_selector_top_k != other.dflash_selector_top_k) return true;
         if (this->dflash_laguna != other.dflash_laguna) return true;
         if (this->dflash_dsv4   != other.dflash_dsv4)   return true;
+        if (this->dflash_dsv41  != other.dflash_dsv41)  return true;
+        if (this->dflash_block_bidir != other.dflash_block_bidir) return true;
         if (this->n_layer       != other.n_layer)       return true;
         if (this->n_rot         != other.n_rot)         return true;
         if (this->n_swa         != other.n_swa)         return true;

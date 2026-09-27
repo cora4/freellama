@@ -24,7 +24,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
     } else {
         delta_net delta(lctx, batch);
 
-        ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+        ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb, &model.hadamard_embd);
         ggml_tensor * inp_out_ids = (n_tokens > 1 && !lctx.cparams.mtp) ? build_inp_out_ids() : nullptr;
         ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
@@ -38,10 +38,10 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
         for (int il = 0; il < n_transformer_layers; ++il) {
 
             if (hparams.is_recurrent(il)) {
-                cur = delta.build_layer_attn_linear(ctx0, gf, inpL, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, il, cb);
+                cur = delta.build_layer_attn_linear(ctx0, gf, inpL, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, il, cb, false, GGML_UNARY_OP_SILU, &model.hadamard_attn, &model.hadamard_ssm);
             } else {
                 cur = build_std_attention(gf, model.layers[il].attn_norm, inpL, inp_pos, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, nullptr,
-                        KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false, true, false, true);
+                        KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false, true, false, true, nullptr, -1, 0.0f, nullptr, nullptr, nullptr, &model.hadamard_attn);
             }
 
             cur = llm_build_std_moe_ffn(ctx0, lctx, model.layers[il].ffn_norm, cur,
@@ -56,7 +56,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
                     n_expert, n_expert_used,
                     LLM_FFN_SILU, true, false, 0.0f,
                     LLM_EXPERT_GATING_FUNC_SOFTMAX,
-                    LLM_FFN_SILU, cb, il, gf, true, model.layers[il].ffn_up_gate_exps, nullptr, model.layers[il].ffn_gate_inp_shexp);
+                    LLM_FFN_SILU, cb, il, gf, true, model.layers[il].ffn_up_gate_exps, nullptr, model.layers[il].ffn_gate_inp_shexp, nullptr, &model.hadamard_attn, &model.hadamard_ffn_down);
 
             cur = lctx.cvec.apply_to(ctx0, cur, il);
             cb(cur, "l_out", il);
@@ -64,7 +64,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
             inpL = cur;
         }
 
-        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb, true, &model.hadamard_attn);
         cb(cur, "result_output", -1);
     }
 
@@ -95,7 +95,7 @@ ggml_cgraph * llm_build_context::build_qwen35() {
     } else {
         delta_net delta(lctx, batch);
 
-        ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+        ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb, &model.hadamard_embd);
         ggml_tensor * inp_out_ids = (n_tokens > 1 && !lctx.cparams.mtp) ? build_inp_out_ids() : nullptr;
         ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
@@ -111,10 +111,10 @@ ggml_cgraph * llm_build_context::build_qwen35() {
         for (int il = 0; il < n_transformer_layers; ++il) {
 
             if (hparams.is_recurrent(il)) {
-                cur = delta.build_layer_attn_linear(ctx0, gf, inpL, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, il, cb);
+                cur = delta.build_layer_attn_linear(ctx0, gf, inpL, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, il, cb, false, GGML_UNARY_OP_SILU, &model.hadamard_attn, &model.hadamard_ssm);
             } else {
                 cur = build_std_attention(gf, model.layers[il].attn_norm, inpL, inp_pos, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, nullptr,
-                        KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false, true, false, true);
+                        KQ_mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false, true, false, true, nullptr, -1, 0.0f, nullptr, nullptr, nullptr, &model.hadamard_attn);
             }
 
             cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, cur,
@@ -122,7 +122,7 @@ ggml_cgraph * llm_build_context::build_qwen35() {
                     model.layers[il].ffn_gate, NULL, NULL,
                     model.layers[il].ffn_down, NULL, NULL,
                     NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true, false);
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true, false, nullptr, nullptr, 0.0f, nullptr, &model.hadamard_attn, &model.hadamard_ffn_down);
 
             cur = lctx.cvec.apply_to(ctx0, cur, il);
             cb(cur, "l_out", il);
@@ -130,7 +130,7 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             inpL = cur;
         }
 
-        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb, true, &model.hadamard_attn);
         cb(cur, "result_output", -1);
     }
 
@@ -173,7 +173,7 @@ struct ggml_tensor * llm_build_context::build_qwen35moe_mtp(
     cur = build_std_attention(gf, mtp_layer.attn_norm, cur,
             inp_pos, nullptr, nullptr,
             KQ_mask, nullptr, nullptr,
-            kq_scale, 0.0f, 0, il, true, false, true, false, true, nullptr);
+            kq_scale, 0.0f, 0, il, true, false, true, false, true, nullptr, -1, 0.0f, nullptr, nullptr, nullptr, &model.hadamard_attn);
 
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
@@ -191,14 +191,14 @@ struct ggml_tensor * llm_build_context::build_qwen35moe_mtp(
             n_expert, n_expert_used,
             LLM_FFN_SILU, true, false, 0.0f,
             LLM_EXPERT_GATING_FUNC_SOFTMAX,
-            LLM_FFN_SILU, cb, il, gf, true, mtp_layer.ffn_up_gate_exps, nullptr, mtp_layer.ffn_gate_inp_shexp);
+            LLM_FFN_SILU, cb, il, gf, true, mtp_layer.ffn_up_gate_exps, nullptr, mtp_layer.ffn_gate_inp_shexp, nullptr, &model.hadamard_attn, &model.hadamard_ffn_down);
 
     cur = lctx.cvec.apply_to(ctx0, cur, il);
     cb(cur, "ffn_out", il);
 
     cb(cur, "result_norm", -1);
 
-    cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb);
+    cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb, true, &model.hadamard_attn);
     cb(cur, "result_output", -1);
 
     return cur;
@@ -240,7 +240,7 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
     cur = build_std_attention(gf, mtp_layer.attn_norm, cur,
             inp_pos, inp_out_ids, nullptr,
             KQ_mask, nullptr, nullptr,
-            kq_scale, 0.0f, 0, il, true, false, true, false, true, nullptr);
+            kq_scale, 0.0f, 0, il, true, false, true, false, true, nullptr, -1, 0.0f, nullptr, nullptr, nullptr, &model.hadamard_attn);
 
     // Dense FFN — optional (9B and 4B don't have FFN in MTP layer)
     if (mtp_layer.ffn_gate != nullptr) {
@@ -249,13 +249,13 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
                 mtp_layer.ffn_gate, NULL, NULL,
                 mtp_layer.ffn_down, NULL, NULL,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true, false);
+                LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true, false, nullptr, nullptr, 0.0f, nullptr, &model.hadamard_attn, &model.hadamard_ffn_down);
     }
 
     cur = lctx.cvec.apply_to(ctx0, cur, il);
     cb(cur, "ffn_out", il);
 
-    cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb);
+    cur = build_output(lctx, ctx0, cur, model.output_mtp, mtp_layer.nextn.shared_head_norm, cb, true, &model.hadamard_attn);
     cb(cur, "result_output", -1);
 
     return cur;

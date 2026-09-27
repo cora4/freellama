@@ -16,6 +16,12 @@ struct llama_kv_cache;
 struct ggml_cgraph;
 struct ggml_tensor;
 
+struct llama_hadamard_transform;
+
+// Prism ternary Hadamard transform (forward: H(Dx), inverse: D(Hz))
+struct ggml_tensor * llm_build_hadamard_rotate(struct ggml_context * ctx0, struct ggml_tensor * cur,
+        const struct llama_hadamard_transform & t, bool inverse = false);
+
 using llm_build_cb = std::function<void(struct ggml_tensor * cur, const char * name, int nl)>;
 
 enum llm_ffn_op_type {
@@ -476,7 +482,7 @@ struct llm_build_context {
         const llama_hparams & hparams,
           const llama_batch & batch,
          struct ggml_tensor * tok_embd,
-         const llm_build_cb & cb);
+         const llm_build_cb & cb, const llama_hadamard_transform * rot = nullptr);
 
     static ggml_tensor * llm_build_norm(ggml_context * ctx, ggml_tensor * cur,
          const llama_hparams & hparams,
@@ -529,7 +535,8 @@ struct llm_build_context {
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
          bool is_norm = false, ggml_tensor * add_extra = nullptr,
          ggml_tensor * post_norm = nullptr, float post_norm_eps = 0.0f,
-         post_norm_data * pnd = nullptr);
+         post_norm_data * pnd = nullptr,
+         const llama_hadamard_transform * rot = nullptr, const llama_hadamard_transform * rot_down = nullptr);
 
     static ggml_tensor * build_dspark_logits(llm_build_context & llm,
             ggml_tensor * base_logits, ggml_tensor * input_tokens,
@@ -604,7 +611,8 @@ llm_expert_gating_func_type   gating_op,
             llm_ffn_op_type   type_op_shexp,
          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * shexp_gate = nullptr, ggml_tensor * add_extra = nullptr);
+         ggml_tensor * shexp_gate = nullptr, ggml_tensor * add_extra = nullptr,
+         const llama_hadamard_transform * rot = nullptr, const llama_hadamard_transform * rot_down = nullptr);
 
     static ggml_cgraph * llama_build_graph_defrag(llama_context & lctx, const std::vector<uint32_t> & ids);
 
@@ -621,12 +629,14 @@ llm_expert_gating_func_type   gating_op,
             ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
             int n_swa, int il, bool do_rope = true, bool add_graph_split = false, bool add_input = false, bool is_norm = false,
             bool is_multi = false, ggml_tensor * post_norm = nullptr, int kv_il = -1, float post_norm_eps = 0.0f,
-            post_norm_data * pnd = nullptr, ggml_tensor ** k_view = nullptr, ggml_tensor ** v_view = nullptr);
+            post_norm_data * pnd = nullptr, ggml_tensor ** k_view = nullptr, ggml_tensor ** v_view = nullptr,
+            const llama_hadamard_transform * rot = nullptr);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
-            ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name = true);
+            ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name = true,
+            const llama_hadamard_transform * rot = nullptr);
 
     static ggml_tensor * do_split_norm(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * the_norm, const llama_hparams & hparams,
         const llm_build_cb & cb, int id, int il_cb, bool is_norm);

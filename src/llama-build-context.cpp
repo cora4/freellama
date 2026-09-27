@@ -891,13 +891,51 @@ ggml_tensor * llm_build_context::llm_build_pos_bias(struct ggml_tensor * pos_buc
     return pos_bias;
 }
 
+// Prism ternary Hadamard transform (forward: H(Dx), inverse: D(Hz))
+struct ggml_tensor * llm_build_hadamard_rotate(
+        struct ggml_context * ctx0,
+        struct ggml_tensor * cur,
+        const llama_hadamard_transform & t,
+        bool inverse) {
+    struct ggml_tensor * res = cur;
+    if (res->type != GGML_TYPE_F32) {
+        res = ggml_cast(ctx0, res, GGML_TYPE_F32);
+    }
+    if (!inverse && t.perm_rep > 1) {
+        // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order (GDN v-grouped)
+        struct ggml_tensor * x = ggml_is_contiguous(res) ? res : ggml_cont(ctx0, res);
+        const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+        x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+        x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+        res = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+    }
+    const bool signs_first = !inverse;
+    if (signs_first && t.signs) {
+        res = ggml_mul(ctx0, res, t.signs);
+    }
+    const int64_t n = t.block_size;
+    GGML_ASSERT(n > 0 && ggml_nelements(res) % n == 0);
+    struct ggml_tensor * rot;
+    if (!ggml_is_contiguous(res)) {
+        rot = ggml_cont_2d(ctx0, res, n, ggml_nelements(res)/n);
+    } else {
+        rot = ggml_reshape_2d(ctx0, res, n, ggml_nelements(res)/n);
+    }
+    rot = ggml_hadamard(ctx0, rot, (int) n);
+    struct ggml_tensor * out = ggml_reshape_4d(ctx0, rot, res->ne[0], res->ne[1], res->ne[2], res->ne[3]);
+    if (!signs_first && t.signs) {
+        out = ggml_mul(ctx0, out, t.signs);
+    }
+    return out;
+}
+
 ggml_tensor * llm_build_context::llm_build_inp_embd(
         struct ggml_context * ctx,
        struct llama_context & lctx,
         const llama_hparams & hparams,
           const llama_batch & batch,
          struct ggml_tensor * tok_embd,
-         const llm_build_cb & cb) {
+         const llm_build_cb & cb, const llama_hadamard_transform * rot) {
     const int64_t n_embd = hparams.n_embd;
 
     struct ggml_tensor * inpL;
@@ -910,6 +948,11 @@ ggml_tensor * llm_build_context::llm_build_inp_embd(
         ggml_set_input(lctx.inp_tokens);
 
         inpL = ggml_get_rows(ctx, tok_embd, lctx.inp_tokens);
+
+        // undo the Hadamard rotation of the embedding table
+        if (rot) {
+            inpL = llm_build_hadamard_rotate(ctx, inpL, *rot, true);
+        }
     } else {
        lctx.inp_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, batch.n_tokens);
         inpL = lctx.inp_embd;
@@ -1180,7 +1223,8 @@ ggml_tensor * llm_build_context::llm_build_ffn(
          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input,
          bool is_norm, ggml_tensor * add_extra,
          ggml_tensor * post_norm, float post_norm_eps,
-         post_norm_data * pnd) {
+         post_norm_data * pnd,
+         const llama_hadamard_transform * rot, const llama_hadamard_transform * rot_down) {
 
     if (!up_b && !up_s && !gate_b && !gate_s && !down_b && !down_s &&
         up->extra && gate->extra && down->extra && type_gate == LLM_FFN_PAR &&
@@ -1206,12 +1250,18 @@ ggml_tensor * llm_build_context::llm_build_ffn(
                 cur = llm_do_split_post_norm(ctx, cur, pnd, id, u->n_device, "attn_post_norm", il_cb, cb);
             }
             cur = do_split_norm(ctx, cur, ffn_norm, lctx.model.hparams, cb, id, il_cb, is_norm);
+            if (rot) {
+                cur = llm_build_hadamard_rotate(ctx, cur, *rot);
+            }
             if (input->op != GGML_OP_REDUCE) {
                 cur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
             }
             cur = ggml_fused_up_gate(ctx, split_u, split_g, cur, unary_op);
             cb(cur, "ffn_up_gate", il_cb);
             *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, lctx.model.arch == LLM_ARCH_BAILINGMOE3);
+            if (rot_down) {
+                cur = llm_build_hadamard_rotate(ctx, cur, *rot_down);
+            }
             cur = llm_build_lora_mm(lctx, ctx, split_d, cur);
             cb(cur, "ffn_down", il_cb);
             if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
@@ -1261,6 +1311,9 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     if (cur->type != GGML_TYPE_F32) {
         cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
     }
+    if (rot) {
+        cur = llm_build_hadamard_rotate(ctx, cur, *rot);
+    }
 
     if (lctx.cparams.fused_up_gate &&
         up && gate && !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
@@ -1272,6 +1325,9 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         cb(cur, "ffn_up_gate", il);
         *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, true);
         if (down) {
+            if (rot_down) {
+                cur = llm_build_hadamard_rotate(ctx, cur, *rot_down);
+            }
             cur = llm_build_lora_mm(lctx, ctx, down, cur);
             cb(cur, "ffn_down", il);
             if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
@@ -1413,6 +1469,9 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     }
 
     if (down) {
+        if (rot_down) {
+            cur = llm_build_hadamard_rotate(ctx, cur, *rot_down);
+        }
         cur = llm_build_lora_mm(lctx, ctx, down, cur);
         if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
             // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
@@ -1744,7 +1803,8 @@ llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input,
          ggml_tensor * up_gate_exps, ggml_tensor * up_gate_exps_b,
          ggml_tensor * shexp_gate,
-         ggml_tensor * add_extra) {
+         ggml_tensor * add_extra,
+         const llama_hadamard_transform * rot, const llama_hadamard_transform * rot_down) {
 
     auto split_up_exps    = up_exps ? (ggml_split_tensor_t *)up_exps->extra : nullptr;
     auto split_gate_exps  = gate_exps ? (ggml_split_tensor_t *)gate_exps->extra : nullptr;
@@ -1821,7 +1881,7 @@ llm_expert_gating_func_type   gating_op,
                             split_up_shexp->splits[id],   split_up_b_shexp   ? split_up_b_shexp->splits[id]   : nullptr, nullptr,
                             split_gate_shexp->splits[id], split_gate_b_shexp ? split_gate_b_shexp->splits[id] : nullptr, nullptr,
                             split_down_shexp->splits[id], !down_bias_added && split_down_b_shexp ? split_down_b_shexp->splits[id] : nullptr, nullptr,
-                            nullptr, type_op_shexp, LLM_FFN_PAR, cb, il, graph, false, false, nullptr);
+                            nullptr, type_op_shexp, LLM_FFN_PAR, cb, il, graph, false, false, nullptr, nullptr, 0.0f, nullptr, rot, rot_down);
                     cb(shared_out, "ffn_shexp_out", il_cb);
                     if (shexp_gate) {
                         auto split_shexp_gate = (ggml_split_tensor_t *)shexp_gate->extra;
@@ -1860,7 +1920,7 @@ llm_expert_gating_func_type   gating_op,
                         up_shexp,   up_b_shexp,   nullptr,
                         gate_shexp, gate_b_shexp, nullptr,
                         down_shexp, down_b_shexp, nullptr,
-                        nullptr, type_op_shexp, LLM_FFN_PAR, cb, il, graph);
+                        nullptr, type_op_shexp, LLM_FFN_PAR, cb, il, graph, false, false, nullptr, nullptr, 0.0f, nullptr, rot, rot_down);
                 cb(shared_out, "ffn_shexp_out", il);
                 if (shexp_gate) {
                     auto shared_gate = llm_build_lora_mm(lctx, ctx, shexp_gate, cur);
@@ -1950,7 +2010,7 @@ llm_expert_gating_func_type   gating_op,
                     split_up_shexp->splits[id],   split_up_b_shexp   ? split_up_b_shexp->splits[id]   : nullptr, nullptr,
                     split_gate_shexp->splits[id], split_gate_b_shexp ? split_gate_b_shexp->splits[id] : nullptr, nullptr,
                     split_down_shexp->splits[id], !down_bias_added && split_down_b_shexp ? split_down_b_shexp->splits[id] : nullptr, nullptr,
-                    nullptr, type_op_shexp, LLM_FFN_PAR, cb, il);
+                    nullptr, type_op_shexp, LLM_FFN_PAR, cb, il, nullptr, false, false, nullptr, nullptr, 0.0f, nullptr, rot, rot_down);
             cb(shared_out, "ffn_shexp_out", il_cb);
             if (shexp_gate) {
                 auto split_shexp_gate = (ggml_split_tensor_t *)shexp_gate->extra;
@@ -2542,7 +2602,8 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
 }
 
 ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
-        ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name) {
+        ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name,
+        const llama_hadamard_transform * rot) {
     // lm_head
     if (output->extra) {
         auto split_output = (ggml_split_tensor_t *)output->extra;
@@ -2593,6 +2654,9 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
             if (add_normed_name) {
                 cb(cur, "result_norm", -1);
             }
+        }
+        if (rot) {
+            cur = llm_build_hadamard_rotate(ctx, cur, *rot);
         }
         cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
     }
@@ -3122,7 +3186,8 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
         int n_swa, int il, bool do_rope, bool add_graph_split, bool add_input, bool is_norm, bool is_multi,
         ggml_tensor * post_norm, int kv_il, float post_norm_eps, post_norm_data * pnd,
-        ggml_tensor ** k_view, ggml_tensor ** v_view) {
+        ggml_tensor ** k_view, ggml_tensor ** v_view,
+        const llama_hadamard_transform * rot) {
 
     float freq_base_l  = n_swa > 0 ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
     float freq_scale_l = n_swa > 0 ? hparams.rope_freq_scale_train_swa : hparams.rope_freq_scale_train;
@@ -3465,6 +3530,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     if (the_attn_norm) {
         cur = llm_build_norm(ctx0, cur, hparams, the_attn_norm, NULL, is_norm ? LLM_NORM : LLM_NORM_RMS, cb, il);
         cb(cur, "attn_norm", il);
+        if (rot) {
+            cur = llm_build_hadamard_rotate(ctx0, cur, *rot);
+        }
     }
     auto input_normed = cur;
 
@@ -3570,6 +3638,20 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 cur = ggml_mul(ctx0, cur, gate);
             }
             cb(cur, "qkv_gated", il);
+            if (rot) {
+                cur = llm_build_hadamard_rotate(ctx0, cur, model.hadamard_attn_out);
+            }
+            cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
+            if (model.layers[il].bo) {
+                cur = ggml_add(ctx0, cur, model.layers[il].bo);
+            }
+            cb(cur, "attn_out", il);
+        } else if (rot) {
+            cur = llm_build_kv(ctx0, lctx, kv_self, gf,
+                    nullptr, nullptr,
+                    Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
+                    k_view, v_view, swa_head);
+            cur = llm_build_hadamard_rotate(ctx0, cur, model.hadamard_attn_out);
             cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
             if (model.layers[il].bo) {
                 cur = ggml_add(ctx0, cur, model.layers[il].bo);

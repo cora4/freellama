@@ -443,6 +443,8 @@ struct llm_build_context {
     ggml_cgraph * build_bailingmoe3();
     ggml_cgraph * build_glm5next();
 
+    ggml_cgraph * build_glm5next_mtp();
+
     ggml_cgraph * build_minimaxm2();
     ggml_cgraph * build_minimaxm3();
 
@@ -455,7 +457,7 @@ struct llm_build_context {
     ggml_cgraph * build_laguna();
 
     ggml_cgraph * build_step35();
-    
+
     ggml_cgraph * build_k2horizon();
 
     ggml_tensor * build_step35_mtp(

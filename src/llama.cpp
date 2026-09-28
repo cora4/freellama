@@ -1179,6 +1179,7 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
 static bool llama_mtp_tail_uses_layer_cache(const llama_model & model) {
     return model.hparams.nextn_predict_layers > 0 &&
         (model.arch == LLM_ARCH_GLM_DSA ||
+         model.arch == LLM_ARCH_GLM5NEXT ||
          model.arch == LLM_ARCH_QWEN35MOE ||
          model.arch == LLM_ARCH_QWEN4EXP ||
          model.arch == LLM_ARCH_STEP35);
@@ -1476,7 +1477,8 @@ static bool llama_kv_cache_init(
             // indexer keys in F16 so a decoded token can score against ALL past keys.
             // GLM5NEXT's k-pool indexer packs [key; gate] per token (gate depends on the hidden
             // state and cannot be recomputed from the cache), so its row is 2*indexer_head_size.
-            if (has_glm_dsa_indexer && model.layers[i].indexer_attn_k && hparams.indexer_is_full[i] && !is_mtp_tail_layer) {
+            if (has_glm_dsa_indexer && model.layers[i].indexer_attn_k && hparams.indexer_is_full[i] &&
+                    (!is_mtp_tail_layer || (model.arch == LLM_ARCH_GLM5NEXT && cparams.dsa))) {
                 const uint32_t idx_row = (model.arch == LLM_ARCH_GLM5NEXT)
                     ? 2 * hparams.indexer_head_size : hparams.indexer_head_size;
                 ggml_tensor * kr = ggml_new_tensor_2d(ctx, idx_type_k, idx_row, kv_size);
@@ -5337,7 +5339,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 #endif
         }
         if (params.defer_ple) {
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
             if (!params.use_mmap) {
                 LLAMA_LOG_WARN("%s: --defer-ple had no effect: mmap is disabled\n", __func__);
             } else {
@@ -5347,7 +5349,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 }
             }
 #else
-            LLAMA_LOG_WARN("%s: deferred per-layer token embedding is only supported on Linux; ignoring defer_ple\n", __func__);
+            LLAMA_LOG_WARN("%s: deferred per-layer token embedding is only supported on Linux and Windows; ignoring defer_ple\n", __func__);
 #endif
         }
         try {
@@ -5504,6 +5506,8 @@ static void llama_kv_prev_tokens(const llama_kv_cache & kv, const llama_batch & 
     }
 }
 
+static constexpr llama_token DSV41_IMAGE_TOKEN_ID = 129264;
+
 // DeepSeek-V4.1 engram row indices for one engram layer: map every token through the
 // compressed vocabulary, fold the n-gram with the per-layer multipliers into a rolling
 // hash, and place each (n-gram size, head) bucket at offset + hash % prime.
@@ -5527,11 +5531,12 @@ static void llama_set_engram_rows(llama_context & lctx, const llama_batch & batc
     std::vector<int32_t> idx((size_t) n_cols * n_tokens);
     std::vector<uint64_t> ctx(n_gram);
     for (int64_t i = 0; i < n_tokens; ++i) {
-        ctx[0] = batch.token ? map_of(batch.token[i]) : pad;
+        const bool cur_image = (batch.token == nullptr) || (batch.token[i] == DSV41_IMAGE_TOKEN_ID);
+        ctx[0] = cur_image ? pad : map_of(batch.token[i]);
         bool blocked = false;
         for (int64_t s = 1; s < n_gram; ++s) {
             const llama_token t = blocked ? -1 : prev[(size_t) i*n_prev + (n_prev - s)];
-            blocked = blocked || t < 0;
+            blocked = blocked || t < 0 || t == DSV41_IMAGE_TOKEN_ID;
             ctx[s] = blocked ? pad : map_of(t);
         }
         uint64_t rolling = ctx[0] * mult[0];
@@ -5882,6 +5887,13 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 }
             }
         }
+        if (lctx.inp_engram_gate_mask) {
+            std::vector<float> m(n_tokens, 1.0f);
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                if (batch.token[i] == DSV41_IMAGE_TOKEN_ID) m[i] = 0.0f;
+            }
+            ggml_backend_tensor_set(lctx.inp_engram_gate_mask, m.data(), 0, m.size()*sizeof(float));
+        }
 #if IK_PRINT_TIMING == 2
         auto tim2 = ggml_time_us();
         printf("set_inputs(token): %d us\n", int(tim2-tim1));
@@ -5896,6 +5908,29 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         const int64_t n_tokens = batch.n_tokens;
 
         ggml_backend_tensor_set(lctx.inp_embd, batch.embd, 0, n_tokens*n_embd*ggml_element_size(lctx.inp_embd));
+
+        if (lctx.inp_engram_gate_mask) {
+            std::vector<float> m(n_tokens, 0.0f);
+            ggml_backend_tensor_set(lctx.inp_engram_gate_mask, m.data(), 0, m.size()*sizeof(float));
+        }
+        if (!lctx.inp_engram_rows.empty()) {
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                GGML_ASSERT((!batch.n_seq_id || batch.n_seq_id[i] == 1) &&
+                        "engram n-gram lookups do not support tokens shared by multiple sequences");
+            }
+            for (ggml_tensor * ids : lctx.inp_engram_gate_ids) {
+                std::vector<int32_t> v(ids->ne[0]);
+                for (int32_t k = 0; k < (int32_t) v.size(); ++k) v[k] = k;
+                ggml_backend_tensor_set(ids, v.data(), 0, v.size()*sizeof(int32_t));
+            }
+            std::vector<llama_token> prev;
+            llama_kv_prev_tokens(lctx.kv_self, batch, hparams.engram_max_ngram_size - 1, prev);
+            for (size_t eg = 0; eg < lctx.inp_engram_rows.size(); ++eg) {
+                if (lctx.inp_engram_rows[eg]) {
+                    llama_set_engram_rows(lctx, batch, (int) eg, lctx.inp_engram_rows[eg], prev);
+                }
+            }
+        }
 #if IK_PRINT_TIMING == 2
         auto tim2 = ggml_time_us();
         printf("set_inputs(embd): %d us\n", int(tim2-tim1));
@@ -9232,6 +9267,7 @@ struct llama_context * llama_init_from_model(
     if (model->arch != LLM_ARCH_GLM4_MOE && model->arch != LLM_ARCH_QWEN35 &&
         model->arch != LLM_ARCH_QWEN35MOE && model->arch != LLM_ARCH_GEMMA4 &&
         model->arch != LLM_ARCH_GEMMA4_MTP && model->arch != LLM_ARCH_GLM_DSA &&
+        model->arch != LLM_ARCH_GLM5NEXT &&
         !llm_arch_is_dsv4(model->arch) &&
         model->arch != LLM_ARCH_STEP35 &&
         model->arch != LLM_ARCH_GEMMA4_ASSISTANT &&
@@ -9801,6 +9837,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_JAIS:
         case LLM_ARCH_GLM5NEXT:
+        case LLM_ARCH_GLM5NEXT_DASHED:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

@@ -1,4 +1,4 @@
-# freellama.cpp
+# freellama
 
 **Fast, local inference for open-weight language models.**
 

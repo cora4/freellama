@@ -23,6 +23,7 @@ jobs:
                     echo "Architecture: Granite Rapids"
                 else
                     echo "Architecture: Emerald Rapids"
+                    exit 1
                 fi
                 #wget -q https://github.com/cora4/ik_llama.cpp/releases/download/spr-28-25/llama-latest-bin-ubuntu-spr.zip -O llama-2.zip
             else
@@ -41,6 +42,7 @@ jobs:
                 else    
                     echo "Architecture: Zen 5"
                 fi
+                exit 1
                 # wget -q https://github.com/cora4/ik_llama.cpp/releases/download/zen4-19-14370/llama-latest-bin-ubuntu-zen4.zip
             fi
         fi
